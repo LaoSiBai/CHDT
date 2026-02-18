@@ -285,7 +285,7 @@ class BPMClassifierApp:
         return all(len(b["songs"]) >= b["max"] for b in self.buckets.values())
 
     def download_audio(self, bv, output_dir):
-        """下载音频，不做格式转换，返回实际下载的文件路径"""
+        """下载音频并转为 wav 格式，返回 wav 文件路径"""
         url = f"https://www.bilibili.com/video/{bv}"
         outtmpl = os.path.join(output_dir, f"{bv}.%(ext)s")
         ydl_opts = {
@@ -295,16 +295,57 @@ class BPMClassifierApp:
             "no_warnings": True,
             "socket_timeout": 30,
             "retries": 3,
-            # 不使用 postprocessors，避免依赖 ffmpeg/ffprobe
         }
         try:
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([url])
-            # 查找实际下载的文件（扩展名可能是 m4a, webm 等）
+            # 查找实际下载的文件
             files = glob.glob(os.path.join(output_dir, f"{bv}.*"))
-            if files:
-                return files[0]
-            return None
+            if not files:
+                return None
+
+            src = files[0]
+            # 如果已经是 wav 就直接返回
+            if src.lower().endswith(".wav"):
+                return src
+
+            # 用 imageio-ffmpeg 内置的 ffmpeg 将 m4a/webm 等转为 wav
+            wav_path = os.path.join(output_dir, f"{bv}.wav")
+            try:
+                import imageio_ffmpeg
+
+                ffmpeg_exe = imageio_ffmpeg.get_ffmpeg_exe()
+            except ImportError:
+                # 回退：尝试系统 ffmpeg
+                ffmpeg_exe = "ffmpeg"
+
+            import subprocess
+
+            result = subprocess.run(
+                [
+                    ffmpeg_exe,
+                    "-i",
+                    src,
+                    "-vn",
+                    "-ar",
+                    "22050",
+                    "-ac",
+                    "1",
+                    "-y",
+                    wav_path,
+                ],
+                capture_output=True,
+                timeout=30,
+            )
+            # 删除原始非 wav 文件
+            if os.path.exists(src) and src != wav_path:
+                os.remove(src)
+
+            if os.path.exists(wav_path) and os.path.getsize(wav_path) > 0:
+                return wav_path
+            else:
+                self.log(f"  ❌ 音频转换失败: ffmpeg 返回码 {result.returncode}")
+                return None
         except Exception as e:
             self.log(f"  ❌ 下载失败: {e}")
             return None
@@ -320,7 +361,7 @@ class BPMClassifierApp:
                 offset = 0
                 dur = duration
 
-            # res_type='kaiser_fast' 使用 scipy 重采样，避免依赖 soxr
+            # wav 文件可直接被 soundfile 读取，无需 soxr
             y, sr = librosa.load(
                 audio_path,
                 sr=22050,
