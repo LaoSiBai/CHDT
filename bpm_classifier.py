@@ -320,7 +320,14 @@ class BPMClassifierApp:
                 offset = 0
                 dur = duration
 
-            y, sr = librosa.load(audio_path, sr=22050, offset=offset, duration=dur)
+            # res_type='kaiser_fast' 使用 scipy 重采样，避免依赖 soxr
+            y, sr = librosa.load(
+                audio_path,
+                sr=22050,
+                offset=offset,
+                duration=dur,
+                res_type="kaiser_fast",
+            )
             tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
             bpm = float(np.atleast_1d(tempo)[0])
             return round(bpm, 1)
