@@ -20,10 +20,17 @@ import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
-import pandas as pd
-import yt_dlp
-import librosa
-import numpy as np
+try:
+    import pandas as pd
+    import yt_dlp
+    import librosa
+    import numpy as np
+except ImportError as e:
+    print(f"❌ 缺少依赖: {e}")
+    print("请先运行 setup.bat 安装环境，或手动执行：")
+    print("  pip install pandas openpyxl yt-dlp librosa soundfile numpy")
+    input("\n按回车键退出...")
+    sys.exit(1)
 
 # ─────────── 配置区 ───────────
 BUCKET_SIZE = 20  # 每个桶的容量
@@ -484,4 +491,11 @@ def main():
 
 
 if __name__ == "__main__":
-    main()
+    try:
+        main()
+    except Exception as e:
+        print("\n" + "=" * 50)
+        print(f"❌ 程序启动失败: {e}")
+        print("=" * 50)
+        traceback.print_exc()
+        input("\n按回车键退出...")
