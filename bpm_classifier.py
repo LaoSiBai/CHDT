@@ -1,8 +1,9 @@
 """
-BPM 分类器 - 彩色电台
-=====================
+BPM 分类器 - 彩色电台 (GUI 版)
+==============================
 从 board.csv 读取 BV 号列表，下载音频分析 BPM，
 按速度分入 BLUE / GREEN / RED 三个桶（各 20 首），满额即停。
+带有 tkinter GUI 界面，可实时查看进度。
 """
 
 import os
@@ -10,10 +11,14 @@ import sys
 import csv
 import time
 import random
+import glob
 import tempfile
 import traceback
+import threading
 
-import imageio_ffmpeg
+import tkinter as tk
+from tkinter import ttk, scrolledtext, messagebox
+
 import yt_dlp
 import librosa
 import numpy as np
@@ -33,223 +38,406 @@ BLUE_DIR = os.path.join(BASE_DIR, "BLUE")
 GREEN_DIR = os.path.join(BASE_DIR, "GREEN")
 RED_DIR = os.path.join(BASE_DIR, "RED")
 
-# FFmpeg 路径（使用 imageio-ffmpeg 内嵌的二进制文件）
-FFMPEG_PATH = imageio_ffmpeg.get_ffmpeg_exe()
 
-# ─────────── 桶 ───────────
-buckets = {
-    "BLUE": {"songs": [], "dir": BLUE_DIR, "label": "🔵 Blue (慢)", "max": BUCKET_SIZE},
-    "GREEN": {
-        "songs": [],
-        "dir": GREEN_DIR,
-        "label": "🟢 Green (中)",
-        "max": BUCKET_SIZE,
-    },
-    "RED": {"songs": [], "dir": RED_DIR, "label": "🔴 Red (快)", "max": BUCKET_SIZE},
-}
+class BPMClassifierApp:
+    def __init__(self, root):
+        self.root = root
+        self.root.title("🎵 彩色电台 BPM 分类器")
+        self.root.geometry("780x620")
+        self.root.resizable(False, False)
+        self.root.configure(bg="#1e1e2e")
 
+        # 运行状态
+        self.running = False
+        self.stop_flag = False
 
-def classify_bpm(bpm: float) -> str:
-    """根据 BPM 返回桶名称"""
-    if bpm < BPM_SLOW_MAX:
-        return "BLUE"
-    elif bpm <= BPM_MED_MAX:
-        return "GREEN"
-    else:
-        return "RED"
+        # 桶数据
+        self.buckets = {
+            "BLUE": {
+                "songs": [],
+                "label": "🔵 Blue (慢)",
+                "max": BUCKET_SIZE,
+                "dir": BLUE_DIR,
+            },
+            "GREEN": {
+                "songs": [],
+                "label": "🟢 Green (中)",
+                "max": BUCKET_SIZE,
+                "dir": GREEN_DIR,
+            },
+            "RED": {
+                "songs": [],
+                "label": "🔴 Red (快)",
+                "max": BUCKET_SIZE,
+                "dir": RED_DIR,
+            },
+        }
 
+        self._build_ui()
 
-def all_buckets_full() -> bool:
-    """检查是否三个桶都已满"""
-    return all(len(b["songs"]) >= b["max"] for b in buckets.values())
+    def _build_ui(self):
+        style = ttk.Style()
+        style.theme_use("clam")
+        style.configure(
+            "Title.TLabel",
+            font=("Microsoft YaHei UI", 16, "bold"),
+            foreground="#cdd6f4",
+            background="#1e1e2e",
+        )
+        style.configure(
+            "Info.TLabel",
+            font=("Microsoft YaHei UI", 10),
+            foreground="#a6adc8",
+            background="#1e1e2e",
+        )
+        style.configure(
+            "Bucket.TLabel",
+            font=("Microsoft YaHei UI", 11, "bold"),
+            foreground="#cdd6f4",
+            background="#1e1e2e",
+        )
+        style.configure("Start.TButton", font=("Microsoft YaHei UI", 11, "bold"))
+        style.configure("Stop.TButton", font=("Microsoft YaHei UI", 11, "bold"))
 
+        # ── 标题 ──
+        title = ttk.Label(
+            self.root, text="🎵 彩色电台 BPM 分类器", style="Title.TLabel"
+        )
+        title.pack(pady=(15, 5))
 
-def bucket_count_str() -> str:
-    """返回当前各桶数量的摘要字符串"""
-    parts = []
-    for name, b in buckets.items():
-        parts.append(f"{b['label']}: {len(b['songs'])}/{b['max']}")
-    return " | ".join(parts)
+        info = ttk.Label(
+            self.root,
+            text=f"阈值: 慢 < {BPM_SLOW_MAX} | {BPM_SLOW_MAX} ≤ 中 ≤ {BPM_MED_MAX} | 快 > {BPM_MED_MAX}   |   每桶 {BUCKET_SIZE} 首",
+            style="Info.TLabel",
+        )
+        info.pack(pady=(0, 10))
 
+        # ── 桶状态面板 ──
+        bucket_frame = tk.Frame(self.root, bg="#1e1e2e")
+        bucket_frame.pack(fill="x", padx=20, pady=(0, 5))
 
-def download_audio(bv: str, output_path: str) -> bool:
-    """使用 yt-dlp 下载 Bilibili 视频的音频（MP3 格式）"""
-    url = f"https://www.bilibili.com/video/{bv}"
-    ydl_opts = {
-        "format": "bestaudio/best",
-        "outtmpl": output_path.replace(".mp3", ".%(ext)s"),
-        "postprocessors": [
-            {
-                "key": "FFmpegExtractAudio",
-                "preferredcodec": "mp3",
-                "preferredquality": "128",
-            }
-        ],
-        "ffmpeg_location": os.path.dirname(FFMPEG_PATH),
-        "quiet": True,
-        "no_warnings": True,
-        "socket_timeout": 30,
-        "retries": 3,
-    }
-    try:
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            ydl.download([url])
-        return os.path.exists(output_path)
-    except Exception as e:
-        print(f"  ❌ 下载失败: {e}")
-        return False
+        self.bucket_labels = {}
+        self.bucket_bars = {}
+        colors = {
+            "BLUE": ("#89b4fa", "#313244"),
+            "GREEN": ("#a6e3a1", "#313244"),
+            "RED": ("#f38ba8", "#313244"),
+        }
 
+        for col_idx, (name, bucket) in enumerate(self.buckets.items()):
+            frame = tk.Frame(bucket_frame, bg="#313244", relief="flat", padx=12, pady=8)
+            frame.grid(row=0, column=col_idx, padx=8, sticky="nsew")
+            bucket_frame.columnconfigure(col_idx, weight=1)
 
-def analyze_bpm(audio_path: str) -> float | None:
-    """使用 librosa 分析音频中间 30 秒的 BPM"""
-    try:
-        # 先获取音频总时长
-        duration = librosa.get_duration(path=audio_path)
+            lbl = tk.Label(
+                frame,
+                text=f"{bucket['label']}",
+                font=("Microsoft YaHei UI", 11, "bold"),
+                fg=colors[name][0],
+                bg="#313244",
+            )
+            lbl.pack()
 
-        # 计算中间 30 秒的偏移量
-        if duration > ANALYSIS_DURATION:
-            offset = (duration - ANALYSIS_DURATION) / 2
-            dur = ANALYSIS_DURATION
+            count_lbl = tk.Label(
+                frame,
+                text="0 / 20",
+                font=("Microsoft YaHei UI", 18, "bold"),
+                fg="#cdd6f4",
+                bg="#313244",
+            )
+            count_lbl.pack(pady=4)
+            self.bucket_labels[name] = count_lbl
+
+            bar = ttk.Progressbar(frame, length=180, maximum=BUCKET_SIZE, value=0)
+            bar.pack(pady=(0, 4))
+            self.bucket_bars[name] = bar
+
+        # ── 总进度 ──
+        prog_frame = tk.Frame(self.root, bg="#1e1e2e")
+        prog_frame.pack(fill="x", padx=28, pady=8)
+
+        self.progress_label = tk.Label(
+            prog_frame,
+            text="就绪 - 点击「开始」运行",
+            font=("Microsoft YaHei UI", 10),
+            fg="#a6adc8",
+            bg="#1e1e2e",
+        )
+        self.progress_label.pack(anchor="w")
+
+        self.total_bar = ttk.Progressbar(prog_frame, length=720, maximum=100, value=0)
+        self.total_bar.pack(fill="x", pady=4)
+
+        # ── 日志区 ──
+        self.log_text = scrolledtext.ScrolledText(
+            self.root,
+            height=13,
+            font=("Consolas", 9),
+            bg="#181825",
+            fg="#cdd6f4",
+            insertbackground="#cdd6f4",
+            relief="flat",
+            state="disabled",
+        )
+        self.log_text.pack(fill="both", padx=20, pady=(0, 10), expand=True)
+
+        # ── 按钮 ──
+        btn_frame = tk.Frame(self.root, bg="#1e1e2e")
+        btn_frame.pack(pady=(0, 15))
+
+        self.start_btn = ttk.Button(
+            btn_frame, text="▶ 开始", style="Start.TButton", command=self.start
+        )
+        self.start_btn.pack(side="left", padx=10)
+
+        self.stop_btn = ttk.Button(
+            btn_frame,
+            text="⏹ 停止",
+            style="Stop.TButton",
+            command=self.stop,
+            state="disabled",
+        )
+        self.stop_btn.pack(side="left", padx=10)
+
+    # ─────────── 日志 ───────────
+    def log(self, msg):
+        """线程安全地写入日志"""
+
+        def _append():
+            self.log_text.configure(state="normal")
+            self.log_text.insert("end", msg + "\n")
+            self.log_text.see("end")
+            self.log_text.configure(state="disabled")
+
+        self.root.after(0, _append)
+
+    # ─────────── UI 更新 ───────────
+    def update_bucket_ui(self):
+        def _update():
+            for name, bucket in self.buckets.items():
+                count = len(bucket["songs"])
+                self.bucket_labels[name].config(text=f"{count} / {bucket['max']}")
+                self.bucket_bars[name]["value"] = count
+
+        self.root.after(0, _update)
+
+    def update_progress(self, current, total, text=""):
+        def _update():
+            pct = (current / total * 100) if total > 0 else 0
+            self.total_bar["value"] = pct
+            self.progress_label.config(text=text or f"处理中... {current}/{total}")
+
+        self.root.after(0, _update)
+
+    # ─────────── 核心逻辑 ───────────
+    def classify_bpm(self, bpm):
+        if bpm < BPM_SLOW_MAX:
+            return "BLUE"
+        elif bpm <= BPM_MED_MAX:
+            return "GREEN"
         else:
-            offset = 0
-            dur = duration
+            return "RED"
 
-        # 加载音频片段
-        y, sr = librosa.load(audio_path, sr=22050, offset=offset, duration=dur)
+    def all_buckets_full(self):
+        return all(len(b["songs"]) >= b["max"] for b in self.buckets.values())
 
-        # 提取 BPM
-        tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-        bpm = float(np.atleast_1d(tempo)[0])
-        return round(bpm, 1)
-    except Exception as e:
-        print(f"  ❌ BPM 分析失败: {e}")
-        return None
+    def download_audio(self, bv, output_dir):
+        """下载音频，不做格式转换，返回实际下载的文件路径"""
+        url = f"https://www.bilibili.com/video/{bv}"
+        outtmpl = os.path.join(output_dir, f"{bv}.%(ext)s")
+        ydl_opts = {
+            "format": "bestaudio/best",
+            "outtmpl": outtmpl,
+            "quiet": True,
+            "no_warnings": True,
+            "socket_timeout": 30,
+            "retries": 3,
+            # 不使用 postprocessors，避免依赖 ffmpeg/ffprobe
+        }
+        try:
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                ydl.download([url])
+            # 查找实际下载的文件（扩展名可能是 m4a, webm 等）
+            files = glob.glob(os.path.join(output_dir, f"{bv}.*"))
+            if files:
+                return files[0]
+            return None
+        except Exception as e:
+            self.log(f"  ❌ 下载失败: {e}")
+            return None
 
+    def analyze_bpm(self, audio_path):
+        """使用 librosa 分析音频中间 30 秒的 BPM"""
+        try:
+            duration = librosa.get_duration(path=audio_path)
+            if duration > ANALYSIS_DURATION:
+                offset = (duration - ANALYSIS_DURATION) / 2
+                dur = ANALYSIS_DURATION
+            else:
+                offset = 0
+                dur = duration
 
-def save_bucket_csv(bucket_name: str):
-    """将桶中的歌曲信息保存为 CSV 文件"""
-    b = buckets[bucket_name]
-    os.makedirs(b["dir"], exist_ok=True)
-    output_path = os.path.join(b["dir"], f"{bucket_name.lower()}.csv")
-    with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
-        writer = csv.writer(f)
-        writer.writerow(["排名", "bv", "曲名", "P主", "歌姬", "BPM"])
-        for song in b["songs"]:
-            writer.writerow(song)
-    print(f"  📄 已保存: {output_path} ({len(b['songs'])} 首)")
+            y, sr = librosa.load(audio_path, sr=22050, offset=offset, duration=dur)
+            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
+            bpm = float(np.atleast_1d(tempo)[0])
+            return round(bpm, 1)
+        except Exception as e:
+            self.log(f"  ❌ BPM 分析失败: {e}")
+            return None
+
+    def save_bucket_csv(self, bucket_name):
+        b = self.buckets[bucket_name]
+        os.makedirs(b["dir"], exist_ok=True)
+        output_path = os.path.join(b["dir"], f"{bucket_name.lower()}.csv")
+        with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
+            writer = csv.writer(f)
+            writer.writerow(["排名", "bv", "曲名", "P主", "歌姬", "BPM"])
+            for song in b["songs"]:
+                writer.writerow(song)
+        self.log(f"  📄 已保存: {output_path} ({len(b['songs'])} 首)")
+
+    # ─────────── 主流程 ───────────
+    def run_classifier(self):
+        self.log("=" * 55)
+        self.log("🎵 彩色电台 BPM 分类器 - 开始运行")
+        self.log("=" * 55)
+
+        # 读取数据
+        if not os.path.exists(CSV_INPUT):
+            self.log(f"❌ 找不到输入文件: {CSV_INPUT}")
+            return
+
+        rows = []
+        with open(CSV_INPUT, "r", encoding="utf-8-sig") as f:
+            reader = csv.DictReader(f)
+            for row in reader:
+                rows.append(row)
+
+        self.log(f"📋 共读取 {len(rows)} 首歌曲\n")
+
+        for idx, row in enumerate(rows, 1):
+            if self.stop_flag:
+                self.log("\n⏹ 用户手动停止。")
+                break
+
+            bv = row.get("bv", "").strip()
+            song_name = row.get("曲名", "未知")
+            artist = row.get("P主", "未知")
+            singer = row.get("歌姬", "未知")
+            rank = row.get("排名", "")
+
+            if not bv:
+                continue
+
+            # 提前终止
+            if self.all_buckets_full():
+                self.log(f"\n🎉 三个桶全部填满！总计 {BUCKET_SIZE * 3} 首，提前终止。")
+                break
+
+            status = f"[{idx}/{len(rows)}] {song_name} - {artist}"
+            self.update_progress(idx, len(rows), status)
+            self.log(f"[{idx}/{len(rows)}] {bv} | {song_name} - {artist}")
+
+            # 下载
+            temp_dir = tempfile.mkdtemp()
+            try:
+                self.log(f"  ⬇️  正在下载...")
+                audio_file = self.download_audio(bv, temp_dir)
+                if not audio_file:
+                    self.log(f"  ⚠️  下载失败，跳过")
+                    continue
+
+                # 分析 BPM
+                self.log(f"  🎧 正在分析 BPM...")
+                bpm = self.analyze_bpm(audio_file)
+                if bpm is None:
+                    self.log(f"  ⚠️  BPM 分析失败，跳过")
+                    continue
+
+                # 分类
+                color = self.classify_bpm(bpm)
+                bucket = self.buckets[color]
+                self.log(f"  🎵 BPM = {bpm} → {bucket['label']}")
+
+                # 检查桶容量
+                if len(bucket["songs"]) >= bucket["max"]:
+                    self.log(f"  ⏭️  {bucket['label']} 已满，跳过")
+                    continue
+
+                # 入桶
+                bucket["songs"].append([rank, bv, song_name, artist, singer, bpm])
+                self.log(
+                    f"  ✅ 入桶！{bucket['label']}: {len(bucket['songs'])}/{bucket['max']}"
+                )
+                self.update_bucket_ui()
+
+                # 休眠
+                sleep_time = random.uniform(SLEEP_MIN, SLEEP_MAX)
+                self.log(f"  💤 休眠 {sleep_time:.1f}s...")
+                time.sleep(sleep_time)
+
+            except Exception as e:
+                self.log(f"  ❌ 出错: {e}")
+                traceback.print_exc()
+            finally:
+                # 清理临时文件
+                try:
+                    for f in glob.glob(os.path.join(temp_dir, "*")):
+                        os.remove(f)
+                    os.rmdir(temp_dir)
+                except OSError:
+                    pass
+
+        # 保存结果
+        self.log("\n" + "=" * 55)
+        self.log("📊 最终结果")
+        self.log("=" * 55)
+        total = sum(len(b["songs"]) for b in self.buckets.values())
+        self.log(f"总计入桶: {total} 首")
+        for name in ["BLUE", "GREEN", "RED"]:
+            b = self.buckets[name]
+            self.log(f"  {b['label']}: {len(b['songs'])}/{b['max']}")
+            self.save_bucket_csv(name)
+
+        self.log("\n✨ 完成！")
+        self.update_progress(100, 100, "✨ 任务完成！")
+
+        # 恢复按钮状态
+        def _done():
+            self.running = False
+            self.start_btn.config(state="normal")
+            self.stop_btn.config(state="disabled")
+
+        self.root.after(0, _done)
+
+    # ─────────── 按钮事件 ───────────
+    def start(self):
+        if self.running:
+            return
+        self.running = True
+        self.stop_flag = False
+        self.start_btn.config(state="disabled")
+        self.stop_btn.config(state="normal")
+
+        # 重置桶
+        for b in self.buckets.values():
+            b["songs"] = []
+        self.update_bucket_ui()
+
+        # 在新线程中运行
+        thread = threading.Thread(target=self.run_classifier, daemon=True)
+        thread.start()
+
+    def stop(self):
+        self.stop_flag = True
+        self.stop_btn.config(state="disabled")
+        self.log("⏳ 正在等待当前任务完成后停止...")
 
 
 def main():
-    sys.stdout.reconfigure(encoding="utf-8")
-
-    print("=" * 60)
-    print("🎵 彩色电台 BPM 分类器")
-    print("=" * 60)
-    print(f"FFmpeg: {FFMPEG_PATH}")
-    print(f"输入: {CSV_INPUT}")
-    print(
-        f"阈值: 慢 < {BPM_SLOW_MAX} | {BPM_SLOW_MAX} ≤ 中 ≤ {BPM_MED_MAX} | 快 > {BPM_MED_MAX}"
-    )
-    print(f"桶容量: 每桶 {BUCKET_SIZE} 首")
-    print("=" * 60)
-
-    # 读取 BV 号列表
-    if not os.path.exists(CSV_INPUT):
-        print(f"❌ 找不到输入文件: {CSV_INPUT}")
-        return
-
-    rows = []
-    with open(CSV_INPUT, "r", encoding="utf-8-sig") as f:
-        reader = csv.DictReader(f)
-        for row in reader:
-            rows.append(row)
-
-    print(f"📋 共读取 {len(rows)} 首歌曲\n")
-
-    # 遍历处理
-    for idx, row in enumerate(rows, 1):
-        bv = row.get("bv", "").strip()
-        song_name = row.get("曲名", "未知")
-        artist = row.get("P主", "未知")
-        singer = row.get("歌姬", "未知")
-        rank = row.get("排名", "")
-
-        if not bv:
-            continue
-
-        # ── 提前终止：三桶全满 ──
-        if all_buckets_full():
-            print(f"\n🎉 三个桶全部填满！总计 {BUCKET_SIZE * 3} 首，提前终止。")
-            break
-
-        print(f"[{idx}/{len(rows)}] {bv} | {song_name} - {artist}")
-        print(f"  桶状态: {bucket_count_str()}")
-
-        # ── 下载音频 ──
-        # 创建临时文件路径
-        temp_dir = tempfile.mkdtemp()
-        temp_audio = os.path.join(temp_dir, f"{bv}.mp3")
-
-        try:
-            print(f"  ⬇️  正在下载...")
-            if not download_audio(bv, temp_audio):
-                print(f"  ⚠️  下载失败，跳过")
-                continue
-
-            # ── 分析 BPM ──
-            print(f"  🎧 正在分析 BPM...")
-            bpm = analyze_bpm(temp_audio)
-            if bpm is None:
-                print(f"  ⚠️  BPM 分析失败，跳过")
-                continue
-
-            # ── 分类 ──
-            color = classify_bpm(bpm)
-            bucket = buckets[color]
-            print(f"  🎵 BPM = {bpm} → {bucket['label']}")
-
-            # ── 检查桶容量 ──
-            if len(bucket["songs"]) >= bucket["max"]:
-                print(
-                    f"  ⏭️  {bucket['label']} 桶已满 ({bucket['max']}/{bucket['max']})，跳过"
-                )
-                continue
-
-            # ── 入桶 ──
-            bucket["songs"].append([rank, bv, song_name, artist, singer, bpm])
-            print(
-                f"  ✅ 入桶成功！{bucket['label']}: {len(bucket['songs'])}/{bucket['max']}"
-            )
-
-            # ── 防封控休眠 ──
-            sleep_time = random.uniform(SLEEP_MIN, SLEEP_MAX)
-            print(f"  💤 休眠 {sleep_time:.1f} 秒...")
-            time.sleep(sleep_time)
-
-        except Exception as e:
-            print(f"  ❌ 处理出错: {e}")
-            traceback.print_exc()
-
-        finally:
-            # ── 始终清理临时文件 ──
-            try:
-                if os.path.exists(temp_audio):
-                    os.remove(temp_audio)
-                os.rmdir(temp_dir)
-            except OSError:
-                pass
-
-    # ── 输出结果 ──
-    print("\n" + "=" * 60)
-    print("📊 最终结果")
-    print("=" * 60)
-    print(bucket_count_str())
-    print()
-
-    for name in ["BLUE", "GREEN", "RED"]:
-        save_bucket_csv(name)
-
-    print("\n✨ 完成！")
+    root = tk.Tk()
+    app = BPMClassifierApp(root)
+    root.mainloop()
 
 
 if __name__ == "__main__":
