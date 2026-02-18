@@ -1,0 +1,15 @@
+# 数据文件夹
+BLUE/
+GREEN/
+RED/
+表格/
+board.csv
+
+# 临时文件
+__pycache__/
+*.tmp
+*.mp3
+
+# 虚拟环境
+venv/
+.env
