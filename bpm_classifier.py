@@ -1,9 +1,10 @@
 """
 BPM 分类器 - 彩色电台 (GUI 版)
 ==============================
-从 board.csv 读取 BV 号列表，下载音频分析 BPM，
-按速度分入 BLUE / GREEN / RED 三个桶（各 20 首），满额即停。
-带有 tkinter GUI 界面，可实时查看进度。
+一站式工具：
+1. 自动检测并将 xlsx 转为 board.csv（如果尚未生成）
+2. 从 board.csv 读取 BV 号，下载音频分析 BPM
+3. 按速度分入 BLUE / GREEN / RED 三个桶（各 20 首），满额即停
 """
 
 import os
@@ -19,6 +20,7 @@ import threading
 import tkinter as tk
 from tkinter import ttk, scrolledtext, messagebox
 
+import pandas as pd
 import yt_dlp
 import librosa
 import numpy as np
@@ -37,6 +39,40 @@ CSV_INPUT = os.path.join(BASE_DIR, "board.csv")
 BLUE_DIR = os.path.join(BASE_DIR, "BLUE")
 GREEN_DIR = os.path.join(BASE_DIR, "GREEN")
 RED_DIR = os.path.join(BASE_DIR, "RED")
+XLSX_DIR = os.path.join(BASE_DIR, "表格")
+
+
+def ensure_board_csv(log_func=print):
+    """如果 board.csv 不存在，自动从 表格/ 文件夹中的 xlsx 文件转换生成"""
+    if os.path.exists(CSV_INPUT):
+        log_func(f"✔ 已检测到 board.csv，跳过转换步骤")
+        return True
+
+    log_func(f"📂 未找到 board.csv，尝试从 表格/ 文件夹转换...")
+
+    if not os.path.exists(XLSX_DIR):
+        log_func(f"❌ 找不到 表格/ 文件夹，请将 xlsx 文件放入该文件夹")
+        return False
+
+    xlsx_files = glob.glob(os.path.join(XLSX_DIR, "*.xlsx"))
+    if len(xlsx_files) == 0:
+        log_func(f"❌ 表格/ 文件夹中没有 .xlsx 文件")
+        return False
+    elif len(xlsx_files) > 1:
+        log_func(f"⚠️ 表格/ 文件夹中有多个 .xlsx 文件，将使用第一个")
+
+    source_file = xlsx_files[0]
+    log_func(f"📊 正在转换: {os.path.basename(source_file)}")
+
+    try:
+        df = pd.read_excel(source_file, engine="openpyxl")
+        df_head = df.head(500)
+        df_head.to_csv(CSV_INPUT, index=False, encoding="utf-8-sig")
+        log_func(f"✅ 已生成 board.csv（{len(df_head)} 行）")
+        return True
+    except Exception as e:
+        log_func(f"❌ 转换失败: {e}")
+        return False
 
 
 class BPMClassifierApp:
@@ -302,9 +338,16 @@ class BPMClassifierApp:
         self.log("🎵 彩色电台 BPM 分类器 - 开始运行")
         self.log("=" * 55)
 
-        # 读取数据
-        if not os.path.exists(CSV_INPUT):
-            self.log(f"❌ 找不到输入文件: {CSV_INPUT}")
+        # 自动检测并生成 board.csv
+        if not ensure_board_csv(log_func=self.log):
+            self.log("\n❌ 无法获取 board.csv，请检查 表格/ 文件夹")
+
+            def _done():
+                self.running = False
+                self.start_btn.config(state="normal")
+                self.stop_btn.config(state="disabled")
+
+            self.root.after(0, _done)
             return
 
         rows = []
