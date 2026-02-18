@@ -29,7 +29,8 @@ foreach ($dir in $dirs) {
     if (!(Test-Path $dir)) {
         New-Item -ItemType Directory -Path $dir | Out-Null
         Write-Host "  ✅ 已创建文件夹: $dir"
-    } else {
+    }
+    else {
         Write-Host "  ✔ 文件夹已存在: $dir"
     }
 }

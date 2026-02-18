@@ -1,10 +1,3 @@
-# 数据文件夹
-BLUE/
-GREEN/
-RED/
-表格/
-board.csv
-
 # 临时文件
 __pycache__/
 *.tmp
@@ -13,3 +6,8 @@ __pycache__/
 # 虚拟环境
 venv/
 .env
+
+# 输出结果文件夹（由脚本生成）
+BLUE/
+GREEN/
+RED/
