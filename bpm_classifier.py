@@ -351,27 +351,118 @@ class BPMClassifierApp:
             return None
 
     def analyze_bpm(self, audio_path):
-        """使用 librosa 分析音频中间 30 秒的 BPM"""
+        """
+        针对 V 家歌曲优化的 BPM 分析
+        策略：
+        1. 分离打击乐信号，去除合成器干扰
+        2. 多段分析（前、中、后各一段），取中位数
+        3. 倍频/半频自动纠正（归化到 70-210 范围）
+        4. start_bpm=140 引导（V 家歌曲典型速度偏快）
+        """
         try:
-            duration = librosa.get_duration(path=audio_path)
-            if duration > ANALYSIS_DURATION:
-                offset = (duration - ANALYSIS_DURATION) / 2
-                dur = ANALYSIS_DURATION
-            else:
-                offset = 0
-                dur = duration
-
-            # wav 文件可直接被 soundfile 读取，无需 soxr
-            y, sr = librosa.load(
-                audio_path,
-                sr=22050,
-                offset=offset,
-                duration=dur,
-                res_type="kaiser_fast",
+            # 加载完整音频（最多 3 分钟，避免内存爆炸）
+            max_load = 180  # 最多加载 180 秒
+            y_full, sr = librosa.load(
+                audio_path, sr=22050, duration=max_load, res_type="kaiser_fast"
             )
-            tempo, _ = librosa.beat.beat_track(y=y, sr=sr)
-            bpm = float(np.atleast_1d(tempo)[0])
-            return round(bpm, 1)
+            total_samples = len(y_full)
+            total_duration = total_samples / sr
+
+            # ── 分离打击乐成分 ──
+            # 电子音乐中合成器会严重干扰节拍检测
+            y_percussive = librosa.effects.percussive(y_full, margin=3.0)
+
+            # ── 多段分析 ──
+            segment_dur = 20  # 每段分析 20 秒
+            segment_samples = int(segment_dur * sr)
+            candidates = []
+
+            if total_duration >= 60:
+                # 歌够长：分析 3 个位置（25%, 50%, 75%）
+                positions = [0.25, 0.50, 0.75]
+            elif total_duration >= 30:
+                # 中等长度：分析 2 个位置
+                positions = [0.33, 0.67]
+            else:
+                # 短歌：直接全曲分析
+                positions = [0.5]
+
+            for pos in positions:
+                center = int(total_samples * pos)
+                start = max(0, center - segment_samples // 2)
+                end = min(total_samples, start + segment_samples)
+                segment = y_percussive[start:end]
+
+                if len(segment) < sr * 5:  # 至少 5 秒
+                    continue
+
+                # 使用 onset_envelope 提高电子音乐检测精度
+                onset_env = librosa.onset.onset_strength(y=segment, sr=sr)
+                tempo = librosa.feature.tempo(
+                    onset_envelope=onset_env,
+                    sr=sr,
+                    start_bpm=140,  # V 家典型起始 BPM
+                    max_tempo=220,  # V 家最快约 220
+                    prior=None,  # 不使用先验分布，让数据说话
+                )
+                bpm_val = float(np.atleast_1d(tempo)[0])
+                candidates.append(bpm_val)
+
+            if not candidates:
+                # 回退：直接分析全曲
+                tempo, _ = librosa.beat.beat_track(y=y_percussive, sr=sr, start_bpm=140)
+                candidates = [float(np.atleast_1d(tempo)[0])]
+
+            # ── 倍频/半频纠正 ──
+            # V 家歌曲通常在 70-210 BPM 范围内
+            corrected = []
+            for bpm in candidates:
+                while bpm > 210:
+                    bpm /= 2
+                while bpm < 70:
+                    bpm *= 2
+                corrected.append(bpm)
+
+            median_bpm = float(np.median(corrected))
+
+            # ── 半频歧义区二次验证 ──
+            # 如果中位数在 95-120 之间，很可能是快歌被检测成半速
+            # 用翻倍值重新验证
+            if 95 <= median_bpm <= 120:
+                double_candidates = []
+                for pos in positions:
+                    center = int(total_samples * pos)
+                    start = max(0, center - segment_samples // 2)
+                    end = min(total_samples, start + segment_samples)
+                    segment = y_percussive[start:end]
+                    if len(segment) < sr * 5:
+                        continue
+                    onset_env = librosa.onset.onset_strength(y=segment, sr=sr)
+                    tempo2 = librosa.feature.tempo(
+                        onset_envelope=onset_env,
+                        sr=sr,
+                        start_bpm=median_bpm * 2,  # 以翻倍值引导
+                        max_tempo=220,
+                        prior=None,
+                    )
+                    double_candidates.append(float(np.atleast_1d(tempo2)[0]))
+
+                if double_candidates:
+                    # 归化到合理范围
+                    dc = []
+                    for b in double_candidates:
+                        while b > 210:
+                            b /= 2
+                        while b < 70:
+                            b *= 2
+                        dc.append(b)
+                    double_median = float(np.median(dc))
+                    # 如果翻倍检测结果在 V 家常见快歌范围(130-200)，采用它
+                    if 130 <= double_median <= 200:
+                        median_bpm = double_median
+
+            return round(median_bpm, 1)
+
         except Exception as e:
             self.log(f"  ❌ BPM 分析失败: {e}")
             return None
