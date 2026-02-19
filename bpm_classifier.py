@@ -10,9 +10,11 @@ BPM 分类器 - 彩色电台 (GUI 版)
 import os
 import sys
 import csv
+import re
 import time
 import random
 import glob
+import shutil
 import tempfile
 import traceback
 import threading
@@ -529,6 +531,8 @@ class BPMClassifierApp:
 
             # 下载
             temp_dir = tempfile.mkdtemp()
+            audio_file = None
+            bucketed = False
             try:
                 self.log(f"  ⬇️  正在下载...")
                 audio_file = self.download_audio(bv, temp_dir)
@@ -559,6 +563,17 @@ class BPMClassifierApp:
                     f"  ✅ 入桶！{bucket['label']}: {len(bucket['songs'])}/{bucket['max']}"
                 )
                 self.update_bucket_ui()
+                bucketed = True
+
+                # 把音频移到桶文件夹
+
+                os.makedirs(bucket["dir"], exist_ok=True)
+                # 用「曲名」命名，去除文件名非法字符
+                safe_name = re.sub(r'[\\/:*?"<>|]', "_", song_name)
+                dest_path = os.path.join(bucket["dir"], f"{safe_name}.wav")
+                shutil.move(audio_file, dest_path)
+                self.log(f"  📁 音频已保存: {os.path.basename(dest_path)}")
+                audio_file = None  # 已移动，不再清理
 
                 # 休眠
                 sleep_time = random.uniform(SLEEP_MIN, SLEEP_MAX)
@@ -569,7 +584,7 @@ class BPMClassifierApp:
                 self.log(f"  ❌ 出错: {e}")
                 traceback.print_exc()
             finally:
-                # 清理临时文件
+                # 只清理未入桶的临时文件
                 try:
                     for f in glob.glob(os.path.join(temp_dir, "*")):
                         os.remove(f)
