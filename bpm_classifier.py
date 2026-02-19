@@ -270,18 +270,45 @@ class BPMClassifierApp:
         def _update():
             pct = (current / total * 100) if total > 0 else 0
             self.total_bar["value"] = pct
-            self.progress_label.config(text=text or f"处理中... {current}/{total}")
 
         self.root.after(0, _update)
 
     # ─────────── 核心逻辑 ───────────
-    def classify_bpm(self, bpm):
-        if bpm < BPM_SLOW_MAX:
-            return "BLUE"
-        elif bpm <= BPM_MED_MAX:
-            return "GREEN"
+    def classify_song(self, bpm, rms, cent):
+        """
+        基于多维特征的综合评分分类
+        Score = 0.45*BPM + 0.40*RMS + 0.15*Cent
+        """
+        # 1. 归一化 (Normalize)
+        # BPM: 70~190 -> 0~1
+        n_bpm = (bpm - 70) / (190 - 70)
+        n_bpm = max(0, min(1, n_bpm))
+
+        # RMS (能量): 0.02~0.12 -> 0~1
+        n_rms = (rms - 0.02) / (0.12 - 0.02)
+        n_rms = max(0, min(1, n_rms))
+
+        # Centroid (亮度): 1000~4000 -> 0~1
+        n_cent = (cent - 1000) / (4000 - 1000)
+        n_cent = max(0, min(1, n_cent))
+
+        # 2. 加权求和
+        w_bpm = 0.45
+        w_rms = 0.40
+        w_cent = 0.15
+
+        score = (w_bpm * n_bpm) + (w_rms * n_rms) + (w_cent * n_cent)
+
+        # 3. 分类阈值
+        if score < 0.35:
+            color = "BLUE"
+        elif score > 0.65:
+            color = "RED"
         else:
-            return "RED"
+            color = "GREEN"
+
+        details = f"B:{n_bpm:.2f} E:{n_rms:.2f} S:{n_cent:.2f}"
+        return color, score, details
 
     def all_buckets_full(self):
         return all(len(b["songs"]) >= b["max"] for b in self.buckets.values())
@@ -463,11 +490,18 @@ class BPMClassifierApp:
                     if 130 <= double_median <= 200:
                         median_bpm = double_median
 
-            return round(median_bpm, 1)
+            # ── 计算能量 (RMS) 和亮度 (Spectral Centroid) ──
+            # 使用全曲计算平均值
+            rms = float(np.mean(librosa.feature.rms(y=y_full)))
+            spec_cent = float(
+                np.mean(librosa.feature.spectral_centroid(y=y_full, sr=sr))
+            )
+
+            return round(median_bpm, 1), round(rms, 4), round(spec_cent, 1)
 
         except Exception as e:
-            self.log(f"  ❌ BPM 分析失败: {e}")
-            return None
+            self.log(f"  ❌ 分析失败: {e}")
+            return None, None, None
 
     def save_bucket_csv(self, bucket_name):
         b = self.buckets[bucket_name]
@@ -475,7 +509,10 @@ class BPMClassifierApp:
         output_path = os.path.join(b["dir"], f"{bucket_name.lower()}.csv")
         with open(output_path, "w", newline="", encoding="utf-8-sig") as f:
             writer = csv.writer(f)
-            writer.writerow(["排名", "bv", "曲名", "P主", "歌姬", "BPM"])
+            # 更新表头：增加 RMS, Spec, Score
+            writer.writerow(
+                ["排名", "bv", "曲名", "P主", "歌姬", "BPM", "RMS", "Spec", "Score"]
+            )
             for song in b["songs"]:
                 writer.writerow(song)
         self.log(f"  📄 已保存: {output_path} ({len(b['songs'])} 首)")
@@ -540,25 +577,28 @@ class BPMClassifierApp:
                     self.log(f"  ⚠️  下载失败，跳过")
                     continue
 
-                # 分析 BPM
-                self.log(f"  🎧 正在分析 BPM...")
-                bpm = self.analyze_bpm(audio_file)
+                # 分析 BPM 及音频特征
+                self.log(f"  🎧 正在分析 (BPM / 能量 / 亮度)...")
+                bpm, rms, cent = self.analyze_bpm(audio_file)
                 if bpm is None:
-                    self.log(f"  ⚠️  BPM 分析失败，跳过")
+                    self.log(f"  ⚠️  分析失败，跳过")
                     continue
 
                 # 分类
-                color = self.classify_bpm(bpm)
+                color, score, details = self.classify_song(bpm, rms, cent)
                 bucket = self.buckets[color]
-                self.log(f"  🎵 BPM = {bpm} → {bucket['label']}")
+                self.log(f"  🎵 BPM={bpm} | RMS={rms:.4f} | Spec={cent:.0f}")
+                self.log(f"  📊 此曲得分: {score:.2f} ({details}) → {bucket['label']}")
 
                 # 检查桶容量
                 if len(bucket["songs"]) >= bucket["max"]:
                     self.log(f"  ⏭️  {bucket['label']} 已满，跳过")
                     continue
 
-                # 入桶
-                bucket["songs"].append([rank, bv, song_name, artist, singer, bpm])
+                # 入桶: [rank, bv, song_name, artist, singer, bpm, rms, cent, score]
+                bucket["songs"].append(
+                    [rank, bv, song_name, artist, singer, bpm, rms, cent, score]
+                )
                 self.log(
                     f"  ✅ 入桶！{bucket['label']}: {len(bucket['songs'])}/{bucket['max']}"
                 )
@@ -566,6 +606,7 @@ class BPMClassifierApp:
                 bucketed = True
 
                 # 把音频移到桶文件夹
+                import shutil
 
                 os.makedirs(bucket["dir"], exist_ok=True)
                 # 用「曲名」命名，去除文件名非法字符
